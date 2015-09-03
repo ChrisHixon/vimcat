@@ -1,0 +1,289 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2015, Chris Hixon 
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without 
+# modification, are permitted provided that the following conditions 
+# are met:
+# 
+# 1. Redistributions of source code must retain the above copyright 
+# notice, this list of conditions and the following disclaimer.
+# 
+# 2. Redistributions in binary form must reproduce the above copyright 
+# notice, this list of conditions and the following disclaimer in the 
+# documentation and/or other materials provided with the distribution.
+# 
+# 3. Neither the name of the copyright holder nor the names of its 
+# contributors may be used to endorse or promote products derived from 
+# this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS 
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE 
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, 
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, 
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; 
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER 
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT 
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN 
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
+# POSSIBILITY OF SUCH DAMAGE.
+
+import sys, os, shutil, signal, tempfile, atexit, pty
+from threading import Thread
+
+# TODO: look into implementing with subprocess module, it might be cleaner 
+# TODO: less ^C can lead to messed up truncated text, weird unicode/bad chars, etc. 
+
+class VimCat(object):
+    signals = (
+            signal.SIGINT,  # 2
+            signal.SIGTERM, # 15
+            signal.SIGHUP,  # 1
+            signal.SIGQUIT, # 3
+            signal.SIGPIPE, # 13
+            signal.SIGALRM  # 14
+            )
+
+    def __init__(self):
+        self.debug_enabled = False # True # enable debugging output to stderr
+        self.output_file = None # '/tmp/vimcat.out' # file to capture pty output (for debugging)
+
+        self.child_pid = 0
+        self.child_fd = -1 
+        self.cleanup_completed = False
+        self.reader = None
+
+        atexit.register(self.exit_handler)
+        self.handle_signals(VimCat.signals)
+
+        self.tmp_dir = tempfile.mkdtemp('', 'vimcat.')
+        self.debug('tmp_dir=' + self.tmp_dir + '\n')
+
+        self.fifo = self.tmp_dir + '/fifo'
+        self.status = self.tmp_dir + '/status'
+        os.mkfifo(self.fifo, 0600)
+        os.mkfifo(self.status, 0600)
+
+        self.vim_c = "runtime vimcat.vim | call AnsiHighlight('%s','%s') | quit" % \
+                (self.fifo, self.status)
+        self.cmd = ['vim', '-E', '-X', '-R', '-n', '-i', 'NONE', '-c', self.vim_c]
+        vimcatrc = os.environ['HOME'] + '/.vimcatrc'
+        if os.path.isfile(vimcatrc):
+            self.cmd += ['-u', vimcatrc]
+        #self.cmd = ['./child_test.sh', self.fifo, self.status]
+
+    def debug(self, str):
+        if self.debug_enabled:
+            sys.stderr.write(str)
+
+    def handle_signals(self, signals):
+        for signum in signals: 
+            signal.signal(signum, self.signal_handler)
+
+    def ignore_signals(self, signals):
+        for signum in signals: 
+            signal.signal(signum, signal.SIG_IGN)
+
+    def exception_signals(self, signals):
+        for signum in signals: 
+            signal.signal(signum, self.exception_signal_handler)
+
+    def exception_signal_handler(self, signum, frame):
+        raise VimCatSignal(signum)
+
+    def signal_handler(self, signum, frame):
+        self.ignore_signals(VimCat.signals)
+        self.debug("signal_handler: got signal %s\n" % signum)
+        self.cleanup()
+        exit(1)
+
+    def exit_handler(self):
+        self.ignore_signals(VimCat.signals)
+        self.debug("exit_handler\n")
+        self.cleanup()
+
+    def finish(self):
+        self.ignore_signals(VimCat.signals)
+        self.cleanup()
+
+    def cleanup(self):
+        if self.cleanup_completed:
+            return
+        self.debug("cleanup\n")
+        self.cleanup_child()
+        self.unlink_fifos()
+        self.cleanup_tmp_dir()
+        self.cleanup_completed = True
+
+    def cleanup_child(self):
+        if self.child_fd > -1:
+            os.close(self.child_fd)
+            self.child_fd = -1
+
+        if self.child_pid:
+            self.debug("killing child (pid=%s) with SIGTERM\n" % self.child_pid)
+            os.kill(self.child_pid, signal.SIGTERM)
+
+            self.debug("flushing data fifo\n")
+            self.flush_fifo(self.fifo)
+            self.debug("flushing status fifo\n")
+            self.flush_fifo(self.status)
+
+            self.debug("waiting for child (pid=%s)\n" % self.child_pid)
+            self.exception_signals(VimCat.signals)
+            signal.alarm(2)
+            try:
+                os.waitpid(self.child_pid, 0)
+            except VimCatSignal, e:
+                self.ignore_signals(VimCat.signals)
+                self.debug("got %s\n" % e)
+                self.debug("killing child (pid=%s) with SIGKILL\n" % self.child_pid)
+                os.kill(self.child_pid, signal.SIGKILL)
+                os.waitpid(self.child_pid, 0)
+            self.child_pid = 0
+
+        if self.reader:
+            self.debug("joining reader\n")
+            self.reader.join()
+            self.reader = None
+
+    def unlink_fifos(self):
+        self.debug("unlink_fifos\n")
+        try:
+            os.unlink(self.fifo)
+            del self.fifo
+        except (OSError, AttributeError):
+            pass
+
+        try:
+            os.unlink(self.status)
+            del self.status
+        except (OSError, AttributeError):
+            pass
+
+    def flush_fifo(self, fifo):
+        try:
+            fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+
+        try:
+            while os.read(fd, 1024) != '':
+                pass
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def cleanup_tmp_dir(self):
+        try:
+            self.debug("removing tmp_dir=" + self.tmp_dir + "\n")
+            shutil.rmtree(self.tmp_dir)
+            del self.tmp_dir
+        except (OSError, AttributeError):
+            pass
+
+    def process(self, file):
+        cmd = self.cmd + ['--', file]
+        self.debug("running cmd %s\n" % (cmd,))
+
+        self.child_pid, self.child_fd = pty.fork()
+        if self.child_pid: # parent
+            self.reader = Reader(self.child_fd, self.output_file, self.debug_enabled)
+            self.reader.start()
+            done = False
+            err = False
+            while not done:
+                fifo = open(self.fifo, 'rb')
+                try:
+                    data = fifo.read()
+                    sys.stdout.write(data)
+                    sys.stdout.flush()
+                except (IOError, OSError):
+                    done = True
+                    err = True
+                finally:
+                    fifo.close()
+
+                status = open(self.status, 'rb')
+                try:
+                    status_val = status.read()
+                    if status_val.rstrip('\n') != 'more':
+                        done = True
+                except (IOError, OSError):
+                    done = True
+                    err = True
+                finally:
+                    status.close()
+
+            if err:
+                self.debug("process encountered an error.\n")
+                self.cleanup_child()
+
+            else:
+                self.debug("completed normally.\n")
+
+                self.debug("closing child_fd\n")
+                os.close(self.child_fd)
+                self.child_fd = -1
+
+                self.debug("waiting for child (pid=%s)\n" % self.child_pid)
+                os.waitpid(self.child_pid, 0)
+                self.child_pid = 0
+
+                self.debug("joining reader\n")
+                self.reader.join()
+                self.reader = None
+
+        else: # child
+            os.execvp(cmd[0], cmd)
+            os._exit(1)
+
+    def run(self, files):
+        for file in files:
+            self.process(file)
+
+class Reader(Thread):
+    def __init__(self, fd, output_file=None, debug=False):
+        self.fd = fd
+        self.output_file = output_file
+        self.debug = debug
+        Thread.__init__(self)
+
+    def run(self):
+        try:
+            output = open(self.output_file, 'wb')
+        except (TypeError, OSError):
+            output = None
+
+        try:
+            while True:
+                data = os.read(self.fd, 1024)
+                if data == '':
+                    break
+                if output:
+                    output.write(data)
+        except OSError, e:
+            if self.debug:
+                sys.stderr.write("Reader got OSError during read loop: %s (this is normal)\n" % e)
+        try:
+            if output:
+                output.close()
+        except OSError, e:
+            if self.debug:
+                sys.stderr.write("Reader got OSError during output.close: %s\n" % e)
+
+class VimCatSignal(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+    def __str__(self):
+        return "signal %s" % repr(self.signum)
+
+if __name__ == '__main__':
+    vimcat = VimCat()
+    vimcat.run(sys.argv[1:])
+    vimcat.finish()
+
