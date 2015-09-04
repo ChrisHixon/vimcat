@@ -1,7 +1,5 @@
 # Vimcat
 
-## Overview
-
 Vimcat displays colored/highlighted text as it is displayed in Vim, using ANSI escape codes. It supports tabular/column alignment, line numbers, line breaks, unicode, full-width characters, and more.
 
 ## Requirements
