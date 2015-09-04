@@ -19,7 +19,7 @@ $ vimcat [FILE]...
 
 ## Details
 
-Vimcat consists of two parts: a Python script that launches a headless Vim in a pseudo-terminal, and a Vimscript to do the ANSI conversion work inside Vim. Output and signaling between processes takes place via named pipes (FIFOs). This method allows Vim to start outputting converted data without having to finish converting the whole file. This is nice for interactive viewing/paging. This idea is a workaround for Vimscript's limitations which requires a slow character by character query for color/highlight information (see :help synID)
+Vimcat consists of two parts: a Python script that launches a headless Vim in a pseudo-terminal, and a Vimscript to do the ANSI conversion work inside Vim. Output and signaling between processes takes place via named pipes (FIFOs). This method allows Vim to start outputting converted data without having to finish converting the whole file. This is nice for interactive viewing/paging. This idea is a workaround for Vimscript's limitations which require a slow character by character query for color/highlight information (see :help synID)
 
 ## Configuration
 
